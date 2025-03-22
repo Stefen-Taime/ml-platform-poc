@@ -1,0 +1,12 @@
+# Récupérer les identifiants MongoDB à partir de .env
+MONGO_ROOT_USER=$(grep MONGO_ROOT_USER .env | cut -d= -f2)
+MONGO_ROOT_PASSWORD=$(grep MONGO_ROOT_PASSWORD .env | cut -d= -f2)
+
+# Exécuter le script
+docker-compose exec -T mongodb mongosh -u $MONGO_ROOT_USER -p $MONGO_ROOT_PASSWORD --authenticationDatabase admin ml_platform < ~/ml-platform-poc/init-mongo-fixed.js
+
+Si votre fichier .env n'est pas accessible ou que les variables sont différentes, vous pouvez adapter la commande avec les valeurs correctes :
+docker-compose exec -T mongodb mongosh -u root -p example --authenticationDatabase admin ml_platform < ~/ml-platform-poc/init-mongo-fixed.js
+Vérifiez que les données ont bien été chargées :
+
+docker-compose exec mongodb mongosh -u $MONGO_ROOT_USER -p $MONGO_ROOT_PASSWORD --authenticationDatabase admin ml_platform --eval "db.models.find().count()"
