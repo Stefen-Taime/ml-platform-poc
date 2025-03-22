@@ -1,0 +1,471 @@
+services:
+  # Service Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"  # Serveur de développement React
+    depends_on:
+      - backend
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+
+  # Service Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Fixed MongoDB connection string with authentication
+      - MONGODB_URI=mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/ml_platform?authSource=admin
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_USE_SSL=false
+      - KEYCLOAK_URL=http://keycloak:8080
+      - KEYCLOAK_REALM=ml-platform
+      - KEYCLOAK_CLIENT_ID=backend-service
+      - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET}
+      - AIRFLOW_API_URL=http://airflow-webserver:8080/api/v1
+      - AIRFLOW_USERNAME=${AIRFLOW_USERNAME}
+      - AIRFLOW_PASSWORD=${AIRFLOW_PASSWORD}
+    depends_on:
+      - mongodb
+      - minio
+      - keycloak
+      - airflow-webserver
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+
+  # Service MongoDB pour les métadonnées
+  mongodb:
+    image: mongo:5.0
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+      - MONGO_INITDB_DATABASE=ml_platform
+    volumes:
+      - ./docker/mongodb/data:/data/db
+      - ./docker/mongodb/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    command: ["--auth"]
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/ml_platform --quiet
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # Mongo Express - Interface d'administration pour MongoDB
+  mongo-express:
+    image: mongo-express:latest
+    ports:
+      - "8083:8081"
+    environment:
+      - ME_CONFIG_MONGODB_SERVER=mongodb
+      - ME_CONFIG_MONGODB_PORT=27017
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=${MONGO_ROOT_USER}
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=${MONGO_ROOT_PASSWORD}
+      - ME_CONFIG_BASICAUTH_USERNAME=admin
+      - ME_CONFIG_BASICAUTH_PASSWORD=admin123
+    depends_on:
+      - mongodb
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+
+  # Service MinIO pour le stockage d'objets
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./docker/minio/data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+
+  # Service MinIO Client pour l'initialisation - fixed version
+  minio-client:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_API_USER=${MINIO_API_USER}
+      - MINIO_API_PASSWORD=${MINIO_API_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      cat > /init-minio.sh << 'EOF'
+      #!/bin/bash
+      
+      # Script d'initialisation pour MinIO
+      # Ce script crée les buckets nécessaires et ajoute des fichiers de démonstration
+      
+      echo "Initialisation de MinIO..."
+      
+      # Attendre que MinIO soit prêt
+      echo "Attente de la disponibilité de MinIO..."
+      until curl -s http://minio:9000/minio/health/ready
+      do
+        echo "MinIO n'est pas encore prêt - attente..."
+        sleep 2
+      done
+      
+      # Configuration du client MinIO
+      mc alias set myminio http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
+      
+      # Créer les buckets
+      echo "Création des buckets..."
+      mc mb myminio/models
+      mc mb myminio/datasets
+      mc mb myminio/results
+      
+      # Définir les politiques d'accès
+      echo "Configuration des politiques d'accès..."
+      mc policy set download myminio/models
+      mc policy set download myminio/datasets
+      mc policy set download myminio/results
+      
+      # Créer des répertoires pour les modèles de démonstration
+      mkdir -p /tmp/minio-init/models/model1
+      mkdir -p /tmp/minio-init/models/model2
+      mkdir -p /tmp/minio-init/models/model3
+      mkdir -p /tmp/minio-init/datasets/ventes
+      mkdir -p /tmp/minio-init/datasets/clients
+      mkdir -p /tmp/minio-init/datasets/transactions
+      mkdir -p /tmp/minio-init/results/ventes/europe
+      mkdir -p /tmp/minio-init/results/clients/global
+      mkdir -p /tmp/minio-init/results/fraude
+      
+      # Créer des fichiers de démonstration pour les modèles
+      echo "Création de fichiers de démonstration..."
+      
+      # Modèle 1: Prévision des ventes
+      cat > /tmp/minio-init/models/model1/model.pkl << EOFMODEL
+      # Ceci est un fichier de démonstration simulant un modèle pickle
+      # Dans un environnement réel, ce serait un véritable modèle sérialisé
+      EOFMODEL
+      
+      cat > /tmp/minio-init/models/model1/metadata.json << EOFMETA
+      {
+        "name": "Prévision des ventes",
+        "version": "1.2.0",
+        "framework": "scikit-learn",
+        "created_at": "2025-01-15T10:30:00Z",
+        "metrics": {
+          "mape": 8.5,
+          "rmse": 245.3,
+          "r2": 0.87
+        }
+      }
+      EOFMETA
+      
+      # Modèle 2: Segmentation clients
+      cat > /tmp/minio-init/models/model2/model.h5 << EOFMODEL
+      # Ceci est un fichier de démonstration simulant un modèle TensorFlow
+      # Dans un environnement réel, ce serait un véritable modèle sérialisé
+      EOFMODEL
+      
+      cat > /tmp/minio-init/models/model2/metadata.json << EOFMETA
+      {
+        "name": "Segmentation clients",
+        "version": "2.0.1",
+        "framework": "tensorflow",
+        "created_at": "2025-02-20T14:45:00Z",
+        "metrics": {
+          "silhouette_score": 0.72,
+          "davies_bouldin_index": 0.85,
+          "calinski_harabasz_index": 120.5
+        }
+      }
+      EOFMETA
+      
+      # Modèle 3: Détection de fraude
+      cat > /tmp/minio-init/models/model3/model.pt << EOFMODEL
+      # Ceci est un fichier de démonstration simulant un modèle PyTorch
+      # Dans un environnement réel, ce serait un véritable modèle sérialisé
+      EOFMODEL
+      
+      cat > /tmp/minio-init/models/model3/metadata.json << EOFMETA
+      {
+        "name": "Détection de fraude",
+        "version": "1.0.5",
+        "framework": "pytorch",
+        "created_at": "2025-01-05T09:15:00Z",
+        "metrics": {
+          "accuracy": 0.95,
+          "precision": 0.92,
+          "recall": 0.89,
+          "f1_score": 0.91,
+          "auc": 0.97
+        }
+      }
+      EOFMETA
+      
+      # Télécharger les fichiers vers MinIO
+      echo "Téléchargement des fichiers vers MinIO..."
+      mc cp --recursive /tmp/minio-init/models/ myminio/models/
+      mc cp --recursive /tmp/minio-init/datasets/ myminio/datasets/
+      mc cp --recursive /tmp/minio-init/results/ myminio/results/
+      
+      # Nettoyage
+      rm -rf /tmp/minio-init
+      
+      echo "Configuration de MinIO terminée!"
+      EOF
+      
+      chmod +x /init-minio.sh && /init-minio.sh
+    networks:
+      - ml-platform-network
+
+  # Service PostgreSQL pour Airflow et Keycloak - Simplified
+  postgres:
+    image: postgres:14
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=postgres
+    volumes:
+      - ./docker/postgres/data:/var/lib/postgresql/data
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Adminer - Interface d'administration pour PostgreSQL
+  adminer:
+    image: adminer:latest
+    ports:
+      - "8084:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=postgres
+      - ADMINER_DESIGN=pappu687
+    depends_on:
+      - postgres
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+
+  # Service for creating required databases - fixed version
+  db-setup:
+    image: postgres:14
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    command: >
+      bash -c "
+        echo 'Creating airflow and keycloak databases if they do not exist...' &&
+        PGPASSWORD=${POSTGRES_PASSWORD} psql -h postgres -U ${POSTGRES_USER} -c 'CREATE DATABASE airflow;' 2>/dev/null || echo 'airflow database already exists' &&
+        PGPASSWORD=${POSTGRES_PASSWORD} psql -h postgres -U ${POSTGRES_USER} -c 'CREATE DATABASE keycloak;' 2>/dev/null || echo 'keycloak database already exists' &&
+        echo 'Databases created successfully!'
+      "
+    networks:
+      - ml-platform-network
+
+  # Service Keycloak pour l'authentification
+  keycloak:
+    image: quay.io/keycloak/keycloak:20.0.3
+    ports:
+      - "8080:8080"
+    environment:
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://postgres:5432/keycloak
+      - KC_DB_USERNAME=${POSTGRES_USER}
+      - KC_DB_PASSWORD=${POSTGRES_PASSWORD}
+      - KC_HOSTNAME=localhost
+    volumes:
+      - ./docker/keycloak/data:/opt/keycloak/data
+    command: start-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-setup:
+        condition: service_completed_successfully
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s
+    
+  # Service Keycloak Initializer
+  keycloak-init:
+    image: curlimages/curl:7.83.1
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+      - KEYCLOAK_CLIENT_SECRET=${KEYCLOAK_CLIENT_SECRET}
+    volumes:
+      - ./docker/keycloak/init-keycloak.sh:/init-keycloak.sh
+    entrypoint: ["/bin/sh", "/init-keycloak.sh"]
+    networks:
+      - ml-platform-network
+
+  # Initialisation des répertoires pour Airflow
+  airflow-init:
+    image: apache/airflow:2.5.3
+    user: "0:0"  # Utiliser root pour initialiser
+    volumes:
+      - ./docker/airflow/dags:/opt/airflow/dags
+      - ./docker/airflow/logs:/opt/airflow/logs
+      - ./docker/airflow/plugins:/opt/airflow/plugins
+      - ./docker/airflow/scripts:/opt/airflow/scripts
+    command: >
+      bash -c "
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
+        chmod -R 777 /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins &&
+        chown -R 50000:0 /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+      "
+    networks:
+      - ml-platform-network
+
+  # Service Airflow Webserver
+  airflow-webserver:
+    image: apache/airflow:2.5.3
+    ports:
+      - "8081:8080"
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_SECRET_KEY}
+      - AIRFLOW_USERNAME=${AIRFLOW_USERNAME}
+      - AIRFLOW_PASSWORD=${AIRFLOW_PASSWORD}
+      - AIRFLOW_FIRST_NAME=Admin
+      - AIRFLOW_LAST_NAME=User
+      - AIRFLOW_EMAIL=admin@example.com
+      - AIRFLOW__API__AUTH_BACKEND=airflow.api.auth.backend.basic_auth
+      # Correction pour activer l'authentification API en tant que interface
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    volumes:
+      - ./docker/airflow/dags:/opt/airflow/dags
+      - ./docker/airflow/logs:/opt/airflow/logs
+      - ./docker/airflow/plugins:/opt/airflow/plugins
+      - ./docker/airflow/scripts:/opt/airflow/scripts
+    user: "50000:0"  # Utilisateur airflow (50000) avec groupe root (0)
+    command: >
+      bash -c "
+        airflow db init &&
+        airflow users create --username ${AIRFLOW_USERNAME} --password ${AIRFLOW_PASSWORD} --firstname Admin --lastname User --role Admin --email admin@example.com &&
+        airflow webserver
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-setup:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Service Airflow Scheduler
+  airflow-scheduler:
+    image: apache/airflow:2.5.3
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    volumes:
+      - ./docker/airflow/dags:/opt/airflow/dags
+      - ./docker/airflow/logs:/opt/airflow/logs
+      - ./docker/airflow/plugins:/opt/airflow/plugins
+      - ./docker/airflow/scripts:/opt/airflow/scripts
+    user: "50000:0"  # Utilisateur airflow (50000) avec groupe root (0)
+    command: >
+      bash -c "airflow scheduler"
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+
+  # Service Spark Master
+  spark-master:
+    image: bitnami/spark:3.3.2
+    ports:
+      - "8082:8080"
+      - "7077:7077"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+
+  # Service Spark Worker
+  spark-worker:
+    image: bitnami/spark:3.3.2
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=1
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    depends_on:
+      - spark-master
+    networks:
+      - ml-platform-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+networks:
+  ml-platform-network:
+    driver: bridge
