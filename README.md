@@ -38,6 +38,8 @@ Notre POC propose une plateforme centralisée basée entièrement sur des techno
 
 ### Architecture globale
 
+![Architecture de la plateforme ML](frontend/public/dashboard.png)
+
 La plateforme sera composée des éléments suivants :
 
 1. **Interface utilisateur (UI)** : Application web permettant aux utilisateurs de configurer et d'exécuter des modèles ML
